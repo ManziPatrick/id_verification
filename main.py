@@ -9,44 +9,16 @@ import uuid
 from datetime import datetime
 from pydantic import BaseModel
 import json
+import numpy as np
 
 # Import our ID card processor
-from id_card_processor import IDCardProcessor, FaceVerifier
+from id_card_processor import IDCardProcessor
 
-# Initialize FastAPI app with proper metadata for Swagger
+# Initialize FastAPI app
 app = FastAPI(
     title="ID Card Verification System API",
-    description="""A comprehensive API for identity verification that:
-    - Extracts data from ID cards using OCR
-    - Verifies face matches between ID photos and selfies
-    - Stores verification results in MongoDB
-    - Provides search and analytics capabilities""",
-    version="2.1.0",
-    contact={
-        "name": "API Support",
-        "email": "support@idverification.com"
-    },
-    license_info={
-        "name": "MIT",
-    },
-    openapi_tags=[
-        {
-            "name": "Verification",
-            "description": "Complete identity verification endpoints",
-        },
-        {
-            "name": "Extraction",
-            "description": "ID card data extraction endpoints",
-        },
-        {
-            "name": "Records",
-            "description": "Verification record access endpoints",
-        },
-        {
-            "name": "System",
-            "description": "System health and monitoring",
-        }
-    ]
+    description="API for identity verification with OCR and face matching",
+    version="2.1.0"
 )
 
 # Add CORS middleware
@@ -58,147 +30,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize the verification API
-verification_api = FaceVerifier()
-
 # Pydantic models for responses
 class VerificationResponse(BaseModel):
-    """Response model for verification results"""
     document_id: str
     extracted_data: dict
     face_verification: dict
     verification_summary: dict
     processed_at: str
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "document_id": "507f1f77bcf86cd799439011",
-                "extracted_data": {
-                    "COUNTRY": "UGANDA",
-                    "SURNAME": "KAMYA",
-                    "GIVEN NAME": "ALICE NAKATO",
-                    "NATIONALITY": "UGANDAN",
-                    "SEX": "F",
-                    "DATE OF BIRTH": "1985-05-15",
-                    "NIN": "CM123456789012",
-                    "CARD NO": "NPP12345678",
-                    "DATE OF EXPIRY": "2025-12-31"
-                },
-                "face_verification": {
-                    "match": True,
-                    "distance": 0.35,
-                    "threshold": 0.6,
-                    "message": "Faces match"
-                },
-                "verification_summary": {
-                    "verified": True,
-                    "score": 0.85
-                },
-                "processed_at": "2023-07-15T12:30:45.123456"
-            }
-        }
-
 class SearchResponse(BaseModel):
-    """Response model for search results"""
     results: list
     count: int
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "results": [
-                    {
-                        "document_id": "507f1f77bcf86cd799439011",
-                        "extracted_data": {
-                            "NIN": "CM123456789012",
-                            "SURNAME": "KAMYA"
-                        },
-                        "processed_at": "2023-07-15T12:30:45.123456"
-                    }
-                ],
-                "count": 1
-            }
-        }
-
 class StatsResponse(BaseModel):
-    """Response model for system statistics"""
     total_records: int
     verified_records: int
     face_matches: int
     verification_rate: float
     face_match_rate: float
-    average_similarity_distance: Optional[float]
-
-    class Config:
-        schema_extra = {
-            "example": {
-                "total_records": 1250,
-                "verified_records": 980,
-                "face_matches": 920,
-                "verification_rate": 0.784,
-                "face_match_rate": 0.736,
-                "average_similarity_distance": 0.42
-            }
-        }
+    average_similarity_score: Optional[float]
 
 class HealthResponse(BaseModel):
-    """Response model for health check"""
     status: str
     timestamp: str
     services: dict
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "status": "healthy",
-                "timestamp": "2023-07-15T12:30:45.123456",
-                "services": {
-                    "mongodb": "healthy",
-                    "face_verification_api": "healthy",
-                    "ocr_model": "loaded"
-                }
-            }
-        }
-
 @app.get("/", include_in_schema=False)
 async def root():
-    """Root endpoint with API information"""
     return {
         "message": "ID Card Verification System API",
         "version": "2.1.0",
         "endpoints": {
-            "verify": "/verify - Complete ID verification with face matching",
-            "extract": "/extract - Extract data from ID card only", 
+            "verify": "/verify - Complete ID verification",
+            "extract": "/extract - Extract ID card data", 
             "record": "/record/{document_id} - Get verification record",
             "search": "/search/{nin} - Search by NIN",
             "stats": "/stats - Get system statistics"
         }
     }
 
-@app.post("/verify", 
-          response_model=VerificationResponse,
-          tags=["Verification"],
-          summary="Complete Identity Verification",
-          description="""Performs complete identity verification by:
-1. Extracting data from the ID card (front and back if provided)
-2. Verifying face match between ID photo and selfie
-3. Storing results in database""",
-          response_description="Verification results with extracted data and face match score")
+@app.post("/verify", response_model=VerificationResponse)
 async def verify_identity(
-    id_card: UploadFile = File(..., description="Front image of ID card in JPEG/PNG format"),
-    selfie: UploadFile = File(..., description="Selfie image for face verification in JPEG/PNG format"),
-    id_card_back: Optional[UploadFile] = File(None, description="Back image of ID card (optional)")
+    id_card: UploadFile = File(...),
+    selfie: UploadFile = File(...),
+    id_card_back: Optional[UploadFile] = File(None)
 ):
-    """
-    Complete identity verification workflow:
-    - Extracts text and structured data from ID card
-    - Verifies face match between ID photo and selfie
-    - Stores results in database
-    - Returns verification results
-    
-    Supports both front and back images of ID cards for enhanced data extraction.
-    """
+    """Complete identity verification workflow"""
     id_card_path = None
     selfie_path = None
     id_card_back_path = None
@@ -231,9 +108,8 @@ async def verify_identity(
             extracted_data=result["extracted_data"],
             face_verification=result["face_verification"],
             verification_summary={
-                "verified": result["face_verification"].get("match", False),
-                "score": 1 - (result["face_verification"].get("distance", 1) / 0.6)
-                if result["face_verification"].get("distance") else None
+                "verified": result["face_verification"].get("verification_status", False),
+                "score": result["face_verification"].get("final_score", 0)
             },
             processed_at=result["metadata"]["processed_at"]
         )
@@ -252,23 +128,12 @@ async def verify_identity(
         if 'processor' in locals():
             processor.close()
 
-@app.post("/extract",
-          tags=["Extraction"],
-          summary="Extract ID Card Data",
-          description="Extracts and returns data from ID card image without face verification",
-          response_description="Extracted data from ID card")
+@app.post("/extract")
 async def extract_id_data(
-    id_card: UploadFile = File(..., description="ID card image in JPEG/PNG format"),
-    include_back: bool = Form(False, description="Set to true if processing back image")
+    id_card: UploadFile = File(...),
+    include_back: bool = Form(False)
 ):
-    """
-    Extracts structured data from ID card image using OCR.
-    
-    Features:
-    - Handles multiple ID card formats
-    - Extracts NIN, personal details, dates
-    - Optionally processes back image for additional data
-    """
+    """Extracts structured data from ID card image"""
     id_card_path = None
     id_card_back_path = None
     
@@ -308,20 +173,9 @@ async def extract_id_data(
         if 'processor' in locals():
             processor.close()
 
-@app.get("/record/{document_id}",
-         tags=["Records"],
-         summary="Get Verification Record",
-         description="Retrieves a complete verification record by its document ID",
-         response_description="Full verification record")
+@app.get("/record/{document_id}")
 async def get_verification_record(document_id: str):
-    """
-    Retrieves a stored verification record by its MongoDB document ID.
-    
-    Returns all stored information including:
-    - Extracted ID data
-    - Face verification results
-    - Processing metadata
-    """
+    """Retrieves a stored verification record"""
     try:
         processor = IDCardProcessor()
         record = processor.get_verification_by_id(document_id)
@@ -338,27 +192,15 @@ async def get_verification_record(document_id: str):
         if 'processor' in locals():
             processor.close()
 
-@app.get("/search/{nin}",
-         response_model=SearchResponse,
-         tags=["Records"],
-         summary="Search by NIN",
-         description="Searches verification records by National Identification Number (NIN)",
-         response_description="Matching verification records")
+@app.get("/search/{nin}", response_model=SearchResponse)
 async def search_by_nin(nin: str):
-    """
-    Searches for all verification records associated with a specific NIN.
-    
-    NIN format should be:
-    - Starts with CM or CF
-    - Followed by 12 alphanumeric characters
-    - Total length 14 characters
-    """
+    """Searches verification records by NIN"""
     try:
-        # Validate NIN format (basic validation)
+        # Validate NIN format
         if not (nin.startswith('CM') or nin.startswith('CF')) or len(nin) != 14:
             raise HTTPException(
                 status_code=400, 
-                detail="Invalid NIN format. NIN should start with 'CM' or 'CF' and be 14 characters long"
+                detail="Invalid NIN format. Should start with 'CM' or 'CF' and be 14 characters"
             )
         
         processor = IDCardProcessor()
@@ -377,27 +219,16 @@ async def search_by_nin(nin: str):
         if 'processor' in locals():
             processor.close()
 
-@app.get("/stats",
-         response_model=StatsResponse,
-         tags=["System"],
-         summary="System Statistics",
-         description="Returns system statistics and performance metrics",
-         response_description="Current system statistics")
+@app.get("/stats", response_model=StatsResponse)
 async def get_system_statistics():
-    """
-    Returns comprehensive system statistics including:
-    - Total verification records
-    - Verification success rates
-    - Face matching statistics
-    - Average processing metrics
-    """
+    """Returns system statistics"""
     try:
         processor = IDCardProcessor()
         stats = {
             "total_records": processor.collection.count_documents({}),
-            "verified_records": processor.collection.count_documents({"verification_status.verified": True}),
-            "face_matches": processor.collection.count_documents({"face_verification.match": True}),
-            "average_similarity_distance": None
+            "verified_records": processor.collection.count_documents({"face_verification.verification_status": True}),
+            "face_matches": processor.collection.count_documents({"face_verification.verification_status": True}),
+            "average_similarity_score": None
         }
         
         # Calculate averages
@@ -405,14 +236,14 @@ async def get_system_statistics():
             stats["verification_rate"] = stats["verified_records"] / stats["total_records"]
             stats["face_match_rate"] = stats["face_matches"] / stats["total_records"]
             
-            # Get average similarity distance
+            # Get average similarity score
             pipeline = [
-                {"$match": {"face_verification.distance": {"$exists": True}}},
-                {"$group": {"_id": None, "avgDistance": {"$avg": "$face_verification.distance"}}}
+                {"$match": {"face_verification.final_score": {"$exists": True}}},
+                {"$group": {"_id": None, "avgScore": {"$avg": "$face_verification.final_score"}}}
             ]
-            avg_distance = list(processor.collection.aggregate(pipeline))
-            if avg_distance:
-                stats["average_similarity_distance"] = avg_distance[0].get("avgDistance")
+            avg_score = list(processor.collection.aggregate(pipeline))
+            if avg_score:
+                stats["average_similarity_score"] = avg_score[0].get("avgScore")
         
         return StatsResponse(**stats)
         
@@ -422,25 +253,12 @@ async def get_system_statistics():
         if 'processor' in locals():
             processor.close()
 
-@app.post("/face-verify-only",
-          tags=["Verification"],
-          summary="Face Verification Only",
-          description="Performs face verification between ID photo and selfie without data extraction",
-          response_description="Face verification results")
+@app.post("/face-verify-only")
 async def face_verify_only(
-    id_card: UploadFile = File(..., description="ID card image with face photo"),
-    selfie: UploadFile = File(..., description="Selfie image for comparison")
+    id_card: UploadFile = File(...),
+    selfie: UploadFile = File(...)
 ):
-    """
-    Performs standalone face verification between:
-    - The photo on an ID card
-    - A provided selfie photo
-    
-    Returns detailed face matching results including:
-    - Similarity score
-    - Match decision
-    - Confidence metrics
-    """
+    """Performs standalone face verification"""
     id_card_path = None
     selfie_path = None
     
@@ -457,18 +275,10 @@ async def face_verify_only(
         
         # Verify face only
         processor = IDCardProcessor()
-        face_verification = processor.verify_face(id_card_path, selfie_path)
-        
-        # Calculate similarity percentage
-        similarity_percentage = None
-        if "distance" in face_verification and face_verification["distance"] is not None:
-            max_distance = 1.2
-            distance = face_verification["distance"]
-            similarity_percentage = max(0, (max_distance - distance) / max_distance * 100)
+        face_verification = processor.face_verifier.compare_faces_all_models(id_card_path, selfie_path)
         
         return {
             "face_verification": face_verification,
-            "similarity_percentage": round(similarity_percentage, 2) if similarity_percentage else None,
             "processed_at": datetime.utcnow().isoformat()
         }
         
@@ -486,38 +296,26 @@ async def face_verify_only(
         if 'processor' in locals():
             processor.close()
 
-@app.get("/health",
-         response_model=HealthResponse,
-         tags=["System"],
-         summary="System Health Check",
-         description="Returns current system health status",
-         response_description="System health status")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """
-    Comprehensive health check endpoint that verifies:
-    - Database connectivity
-    - External service availability
-    - Model loading status
-    - Overall system health
-    """
+    """System health check"""
     try:
         # Test MongoDB connection
         processor = IDCardProcessor()
-        stats = {
-            "total_records": processor.collection.count_documents({}),
-            "verified_records": processor.collection.count_documents({"verification_status.verified": True}),
-        }
-        mongo_status = "healthy" if isinstance(stats["total_records"], int) else "error"
+        mongo_status = "healthy"
+        try:
+            stats = processor.collection.count_documents({})
+        except:
+            mongo_status = "unreachable"
         
         # Test face verification capability
         face_api_status = "healthy"
         try:
             test_img = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-            descriptor = processor.face_verifier.get_face_descriptor(test_img)
-            if descriptor is None:
-                face_api_status = "unresponsive"
+            if not processor.face_verifier.models["dlib"]["enabled"] and not processor.face_verifier.models["face_recognition"]["enabled"]:
+                face_api_status = "partial (some models unavailable)"
         except:
-            face_api_status = "unreachable"
+            face_api_status = "unhealthy"
         
         return HealthResponse(
             status="healthy",
@@ -581,9 +379,4 @@ async def global_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        reload=True
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)

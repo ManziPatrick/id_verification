@@ -1,4 +1,3 @@
-import torch
 import re
 import base64
 from io import BytesIO
@@ -6,8 +5,7 @@ from PIL import Image
 import pymongo
 from pymongo import MongoClient
 from datetime import datetime
-from doctr.io import DocumentFile
-from doctr.models import ocr_predictor
+from paddleocr import PaddleOCR
 from pprint import pprint
 from typing import Optional, Dict, Any, List
 import json
@@ -15,35 +13,211 @@ import os
 import cv2
 import numpy as np
 import dlib
+import face_recognition
+from deepface import DeepFace
+from facenet_pytorch import MTCNN, InceptionResnetV1
+import warnings
+from collections import Counter
+import torch
 
-class FaceVerifier:
-    """Integrated face verification using dlib"""
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+class MultiOCRProcessor:
+    """Handles OCR processing using only PaddleOCR"""
     
     def __init__(self):
-        """Initialize dlib models for face detection and recognition"""
+        self.engines = {
+            'paddle': self._init_paddle(),
+            'easyocr': None,
+            'doctr': None,
+            'tesseract': None
+        }
+        print("\n[OCR ENGINE INITIALIZATION]")
+        for engine, status in self.engines.items():
+            print(f"- {engine.upper()}: {'✅ Ready' if status else '❌ Disabled'}")
+        
+    def _init_paddle(self):
         try:
-            self.detector = dlib.get_frontal_face_detector()
+            print("Initializing PaddleOCR...")
+            paddle = PaddleOCR(
+                use_angle_cls=True,
+                lang='en',
+                use_gpu=False,
+                enable_mkldnn=False,
+                rec_algorithm='SVTR_LCNet'
+            )
+            print("PaddleOCR initialized successfully")
+            return paddle
+        except Exception as e:
+            print(f"[WARNING] PaddleOCR init failed: {e}")
+            return None
+    
+    def _init_easyocr(self):
+        return None
+    
+    def _init_doctr(self):
+        return None
+    
+    def _init_tesseract(self):
+        return False
+    
+    def preprocess_image(self, img_path: str) -> np.ndarray:
+        """Standard image preprocessing for all OCR engines"""
+        print(f"\nPreprocessing image: {img_path}")
+        img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f"Could not read image from {img_path}")
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        _, thresholded = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresholded
+    
+    def extract_with_paddle(self, img_path: str) -> List[str]:
+        if not self.engines['paddle']:
+            return []
+        try:
+            print("\n[PADDLEOCR EXTRACTION]")
+            result = self.engines['paddle'].ocr(img_path, cls=True)
+            extracted = [line[1][0] for line in result[0]] if result else []
+            print(f"Extracted {len(extracted)} items: {extracted}")
+            return extracted
+        except Exception as e:
+            print(f"[ERROR] PaddleOCR extraction failed: {e}")
+            return []
+    
+    def extract_with_easyocr(self, img_path: str) -> List[str]:
+        return []
+    
+    def extract_with_doctr(self, img_path: str) -> List[str]:
+        return []
+    
+    def extract_with_tesseract(self, img_path: str) -> List[str]:
+        return []
+    
+    def extract_consensus_text(self, img_path: str) -> Dict[str, Any]:
+        """Get text from PaddleOCR only"""
+        print(f"\n[STARTING EXTRACTION FOR {img_path}]")
+        
+        results = {
+            'paddle': self.extract_with_paddle(img_path),
+            'easyocr': [],
+            'doctr': [],
+            'tesseract': []
+        }
+        
+        # Since we're only using PaddleOCR, all extracted text is considered consensus
+        text_scores = {}
+        for text in results['paddle']:
+            if text not in text_scores:
+                text_scores[text] = {'count': 1, 'engines': ['paddle']}
+        
+        consensus = [
+            {'text': text, 'confidence': 1.0, 'engines': data['engines']}
+            for text, data in text_scores.items()
+        ]
+        
+        # Sort by confidence (highest first)
+        consensus.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        final_result = {
+            'consensus_text': [item['text'] for item in consensus],
+            'confidence_scores': consensus,
+            'all_results': results,
+            'engine_availability': {k: v is not None for k, v in self.engines.items()}
+        }
+        
+        print("\n[FINAL EXTRACTION RESULTS]")
+        pprint(final_result)
+        
+        return final_result
+
+class MultiModelFaceVerifier:
+    """Integrated face verification using multiple models"""
+    
+    def __init__(self):
+        """Initialize all face verification models"""
+        self.models = {
+            "dlib": self._init_dlib(),
+            "face_recognition": self._init_face_recognition(),
+            "deepface_vgg": {"model": "VGG-Face", "enabled": True},
+            "deepface_facenet": {"model": "Facenet", "enabled": True},
+            "facenet_pytorch": self._init_facenet_pytorch(),
+            "deepface_arcface": {"model": "ArcFace", "enabled": True},
+            "deepface_openface": {"model": "OpenFace", "enabled": True}
+        }
+        
+        # Model weights for final decision
+        self.model_weights = {
+            "dlib": 0.15,
+            "face_recognition": 0.15,
+            "deepface_vgg": 0.15,
+            "deepface_facenet": 0.15,
+            "facenet_pytorch": 0.15,
+            "deepface_arcface": 0.15,
+            "deepface_openface": 0.10
+        }
+        
+        # Minimum required similarity for each model
+        self.minimum_similarity = 0.40
+        
+        print("\n[FACE VERIFICATION MODELS INITIALIZED]")
+        for model, status in self.models.items():
+            print(f"- {model.upper()}: {'✅ Ready' if status.get('enabled', False) else '❌ Disabled'}")
+    
+    def _init_dlib(self) -> Dict[str, Any]:
+        """Initialize dlib models"""
+        try:
+            detector = dlib.get_frontal_face_detector()
             
-            # Try to load the models - you'll need to download these files
             predictor_path = "shape_predictor_68_face_landmarks.dat"
             face_model_path = "dlib_face_recognition_resnet_model_v1.dat"
             
             if os.path.exists(predictor_path) and os.path.exists(face_model_path):
-                self.predictor = dlib.shape_predictor(predictor_path)
-                self.face_rec_model = dlib.face_recognition_model_v1(face_model_path)
-                self.models_loaded = True
-                print("[INFO] Dlib face recognition models loaded successfully")
+                predictor = dlib.shape_predictor(predictor_path)
+                face_rec_model = dlib.face_recognition_model_v1(face_model_path)
+                return {
+                    "detector": detector,
+                    "predictor": predictor,
+                    "face_rec_model": face_rec_model,
+                    "enabled": True
+                }
             else:
-                print("[WARNING] Dlib model files not found. Face verification will be simulated.")
-                print(f"[INFO] Missing files: {predictor_path}, {face_model_path}")
-                print("[INFO] Download from: http://dlib.net/files/")
-                self.models_loaded = False
-                
+                print(f"[WARNING] Dlib model files not found at {predictor_path} or {face_model_path}")
+                return {"enabled": False}
         except Exception as e:
-            print(f"[WARNING] Failed to initialize dlib models: {e}")
-            self.models_loaded = False
+            print(f"[WARNING] Failed to initialize dlib: {e}")
+            return {"enabled": False}
     
-    def read_image_from_path(self, image_path: str) -> np.ndarray:
+    def _init_face_recognition(self) -> Dict[str, Any]:
+        """Initialize face_recognition model"""
+        try:
+            # Just test loading a small image to verify the model works
+            img = np.zeros((100, 100, 3), dtype=np.uint8)
+            _ = face_recognition.face_encodings(img)
+            return {"enabled": True}
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize face_recognition: {e}")
+            return {"enabled": False}
+    
+    def _init_facenet_pytorch(self) -> Dict[str, Any]:
+        """Initialize FaceNet PyTorch model"""
+        try:
+            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            mtcnn = MTCNN(keep_all=True, device=device)
+            resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+            return {
+                "mtcnn": mtcnn,
+                "resnet": resnet,
+                "device": device,
+                "enabled": True
+            }
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize facenet_pytorch: {e}")
+            return {"enabled": False}
+    
+    def read_image(self, image_path: str) -> np.ndarray:
         """Read image from file path"""
         try:
             image = cv2.imread(image_path)
@@ -53,134 +227,296 @@ class FaceVerifier:
         except Exception as e:
             raise ValueError(f"Error reading image: {e}")
     
-    def find_face(self, image: np.ndarray) -> Optional[np.ndarray]:
-        """Find and extract face from image"""
-        if not self.models_loaded:
-            return image  # Return full image if models not loaded
-            
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess image for face detection"""
         try:
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            faces = self.detector(image_rgb)
-            
-            if not faces:
-                return None
-                
-            face = faces[0]
-            x1 = max(face.left(), 0)
-            y1 = max(face.top(), 0)
-            x2 = min(face.right(), image.shape[1])
-            y2 = min(face.bottom(), image.shape[0])
-            
-            return image[y1:y2, x1:x2]
-            
+            # Convert to RGB (most models expect RGB)
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            return rgb_image
         except Exception as e:
-            print(f"[ERROR] Face detection failed: {e}")
-            return None
+            raise ValueError(f"Error preprocessing image: {e}")
     
-    def get_face_descriptor(self, image: np.ndarray) -> Optional[np.ndarray]:
-        """Get face descriptor for comparison"""
-        if not self.models_loaded:
-            # Return a dummy descriptor for simulation
-            return np.random.rand(128)
+    def detect_faces_dlib(self, image: np.ndarray) -> List[Any]:
+        """Detect faces using dlib"""
+        if not self.models["dlib"]["enabled"]:
+            return []
             
         try:
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            dets = self.detector(image_rgb, 1)
+            dets = self.models["dlib"]["detector"](image, 1)
+            return dets
+        except Exception as e:
+            print(f"[ERROR] dlib face detection failed: {e}")
+            return []
+    
+    def get_face_descriptor_dlib(self, image: np.ndarray, face) -> Optional[np.ndarray]:
+        """Get face descriptor using dlib"""
+        if not self.models["dlib"]["enabled"]:
+            return None
             
-            if len(dets) == 0:
-                return None
-                
-            shape = self.predictor(image_rgb, dets[0])
-            face_descriptor = self.face_rec_model.compute_face_descriptor(image_rgb, shape)
+        try:
+            shape = self.models["dlib"]["predictor"](image, face)
+            face_descriptor = self.models["dlib"]["face_rec_model"].compute_face_descriptor(image, shape)
             return np.array(face_descriptor)
-            
         except Exception as e:
-            print(f"[ERROR] Face descriptor computation failed: {e}")
+            print(f"[ERROR] dlib face descriptor failed: {e}")
             return None
     
-    def compare_faces(self, img1: np.ndarray, img2: np.ndarray, threshold: float = 0.6) -> tuple:
-        """Compare two face images"""
+    def compare_faces_dlib(self, img1: np.ndarray, img2: np.ndarray) -> Optional[float]:
+        """Compare faces using dlib"""
+        if not self.models["dlib"]["enabled"]:
+            return None
+            
         try:
-            desc1 = self.get_face_descriptor(img1)
-            desc2 = self.get_face_descriptor(img2)
+            # Detect faces
+            dets1 = self.detect_faces_dlib(img1)
+            dets2 = self.detect_faces_dlib(img2)
+            
+            if not dets1 or not dets2:
+                return None
+                
+            # Get descriptors
+            desc1 = self.get_face_descriptor_dlib(img1, dets1[0])
+            desc2 = self.get_face_descriptor_dlib(img2, dets2[0])
             
             if desc1 is None or desc2 is None:
-                return None, None
+                return None
                 
+            # Calculate distance (lower is more similar)
             dist = np.linalg.norm(desc1 - desc2)
-            match = dist < threshold
+            # Convert to similarity score (0-1)
+            similarity = 1 - (dist / 1.5)  # Normalize with max expected distance
+            return max(0, min(1, similarity))
             
-            return float(dist), bool(match)
+        except Exception as e:
+            print(f"[ERROR] dlib face comparison failed: {e}")
+            return None
+    
+    def compare_faces_face_recognition(self, img1: np.ndarray, img2: np.ndarray) -> Optional[float]:
+        """Compare faces using face_recognition library"""
+        if not self.models["face_recognition"]["enabled"]:
+            return None
+            
+        try:
+            # Get face encodings
+            encodings1 = face_recognition.face_encodings(img1)
+            encodings2 = face_recognition.face_encodings(img2)
+            
+            if not encodings1 or not encodings2:
+                return None
+                
+            # Calculate face distance
+            distance = face_recognition.face_distance([encodings1[0]], encodings2[0])[0]
+            # Convert to similarity (0-1)
+            similarity = 1 - distance
+            return max(0, min(1, similarity))
+            
+        except Exception as e:
+            print(f"[ERROR] face_recognition comparison failed: {e}")
+            return None
+    
+    def compare_faces_deepface(self, img1: np.ndarray, img2: np.ndarray, model_name: str) -> Optional[float]:
+        """Compare faces using DeepFace with specified model"""
+        model_info = self.models[f"deepface_{model_name.lower()}"]
+        if not model_info["enabled"]:
+            return None
+            
+        try:
+            # DeepFace expects BGR images
+            img1_bgr = cv2.cvtColor(img1, cv2.COLOR_RGB2BGR)
+            img2_bgr = cv2.cvtColor(img2, cv2.COLOR_RGB2BGR)
+            
+            result = DeepFace.verify(
+                img1_path=img1_bgr,
+                img2_path=img2_bgr,
+                model_name=model_info["model"],
+                detector_backend='opencv',
+                enforce_detection=False,
+                silent=True
+            )
+            
+            # Different DeepFace models return different similarity metrics
+            if 'distance' in result:
+                # For models that return distance (smaller is better)
+                distance = result['distance']
+                # Convert to similarity (0-1)
+                if model_info["model"] == "VGG-Face":
+                    similarity = 1 - (distance / 1.2)  # VGG-Face max distance ~1.2
+                elif model_info["model"] == "Facenet":
+                    similarity = 1 - (distance / 1.5)  # Facenet max distance ~1.5
+                elif model_info["model"] == "ArcFace":
+                    similarity = 1 - (distance / 1.5)  # ArcFace max distance ~1.5
+                else:
+                    similarity = 1 - distance  # Default
+            elif 'similarity_metric' in result:
+                # For models that return similarity directly
+                similarity = result['similarity_metric']
+            else:
+                similarity = result['verified'] * 1.0  # Boolean to 0 or 1
+                
+            return max(0, min(1, similarity))
+            
+        except Exception as e:
+            print(f"[ERROR] DeepFace {model_info['model']} comparison failed: {e}")
+            return None
+    
+    def compare_faces_facenet_pytorch(self, img1: np.ndarray, img2: np.ndarray) -> Optional[float]:
+        """Compare faces using FaceNet PyTorch"""
+        if not self.models["facenet_pytorch"]["enabled"]:
+            return None
+            
+        try:
+            model = self.models["facenet_pytorch"]
+            device = model["device"]
+            mtcnn = model["mtcnn"]
+            resnet = model["resnet"]
+            
+            # Detect faces
+            faces1 = mtcnn(img1)
+            faces2 = mtcnn(img2)
+            
+            if faces1 is None or faces2 is None:
+                return None
+                
+            # Get embeddings
+            emb1 = resnet(faces1.unsqueeze(0).to(device)).detach().cpu()
+            emb2 = resnet(faces2.unsqueeze(0).to(device)).detach().cpu()
+            
+            # Calculate distance (Euclidean)
+            dist = torch.nn.functional.pairwise_distance(emb1, emb2).item()
+            # Convert to similarity (0-1)
+            similarity = 1 - (dist / 1.5)  # Normalize with max expected distance
+            return max(0, min(1, similarity))
+            
+        except Exception as e:
+            print(f"[ERROR] FaceNet PyTorch comparison failed: {e}")
+            return None
+    
+    def compare_faces_all_models(self, img1_path: str, img2_path: str) -> Dict[str, Any]:
+        """Compare faces using all available models"""
+        results = {}
+        
+        try:
+            print("\n[FACE VERIFICATION PROCESS STARTED]")
+            print(f"- ID Image: {img1_path}")
+            print(f"- Selfie Image: {img2_path}")
+            
+            # Read and preprocess images
+            img1 = self.preprocess_image(self.read_image(img1_path))
+            img2 = self.preprocess_image(self.read_image(img2_path))
+            
+            print("\n[RUNNING FACE COMPARISONS]")
+            
+            # Dlib comparison
+            if self.models["dlib"]["enabled"]:
+                print("- Running dlib comparison...")
+                dlib_sim = self.compare_faces_dlib(img1, img2)
+                results["dlib"] = dlib_sim
+                print(f"  dlib similarity: {dlib_sim or 'N/A'}")
+            
+            # face_recognition comparison
+            if self.models["face_recognition"]["enabled"]:
+                print("- Running face_recognition comparison...")
+                fr_sim = self.compare_faces_face_recognition(img1, img2)
+                results["face_recognition"] = fr_sim
+                print(f"  face_recognition similarity: {fr_sim or 'N/A'}")
+            
+            # DeepFace comparisons
+            for model in ["vgg", "facenet", "arcface", "openface"]:
+                model_key = f"deepface_{model}"
+                if self.models[model_key]["enabled"]:
+                    print(f"- Running DeepFace {model} comparison...")
+                    sim = self.compare_faces_deepface(img1, img2, model)
+                    results[model_key] = sim
+                    print(f"  DeepFace {model} similarity: {sim or 'N/A'}")
+            
+            # FaceNet PyTorch comparison
+            if self.models["facenet_pytorch"]["enabled"]:
+                print("- Running FaceNet PyTorch comparison...")
+                fn_sim = self.compare_faces_facenet_pytorch(img1, img2)
+                results["facenet_pytorch"] = fn_sim
+                print(f"  FaceNet PyTorch similarity: {fn_sim or 'N/A'}")
+            
+            # Calculate weighted score
+            weighted_score = 0.0
+            total_weight = 0.0
+            valid_models = 0
+            
+            for model_name, score in results.items():
+                if score is not None:
+                    weight = self.model_weights.get(model_name, 0.1)
+                    weighted_score += score * weight
+                    total_weight += weight
+                    valid_models += 1
+            
+            if total_weight > 0:
+                final_score = weighted_score / total_weight
+            else:
+                final_score = 0.0
+            
+            # Determine verification status
+            verification_status = False
+            if valid_models >= 3:  # At least 3 models must agree
+                # Check if final score meets threshold and no model is below minimum
+                below_minimum = any(
+                    score is not None and score < self.minimum_similarity 
+                    for score in results.values()
+                )
+                
+                if final_score >= 0.55 and not below_minimum:
+                    verification_status = True
+            
+            results["final_score"] = final_score
+            results["verification_status"] = verification_status
+            results["valid_models"] = valid_models
+            
+            print("\n[FACE VERIFICATION SUMMARY]")
+            print(f"- Final Score: {final_score:.2f}")
+            print(f"- Verification Status: {'✅ Verified' if verification_status else '❌ Not Verified'}")
+            print(f"- Models Used: {valid_models}")
+            
+            return results
             
         except Exception as e:
             print(f"[ERROR] Face comparison failed: {e}")
-            return None, None
-    
-    def verify_faces(self, id_card_path: str, selfie_path: str) -> Dict[str, Any]:
-        """Main face verification method"""
-        try:
-            # Read images
-            img1 = self.read_image_from_path(id_card_path)
-            img2 = self.read_image_from_path(selfie_path)
-            
-            # Find faces
-            face1 = self.find_face(img1)
-            face2 = self.find_face(img2)
-            
-            if face1 is None or face2 is None:
-                return {
-                    "error": "One or both faces not detected",
-                    "match": False,
-                    "distance": None,
-                    "threshold": 0.6
-                }
-            
-            # Compare faces
-            distance, match = self.compare_faces(face1, face2)
-            
-            if distance is None:
-                return {
-                    "error": "Could not compute face descriptors",
-                    "match": False,
-                    "distance": None,
-                    "threshold": 0.6
-                }
-            
             return {
-                "match": match,
-                "distance": round(distance, 4),
-                "threshold": 0.6,
-                "message": "Faces match" if match else "Faces do not match",
-                "models_loaded": self.models_loaded
+                "error": str(e),
+                "final_score": 0.0,
+                "verification_status": False
             }
-            
-        except Exception as e:
-            return {
-                "error": f"Face verification error: {str(e)}",
-                "match": False,
-                "distance": None,
-                "threshold": 0.6
-            }
-
 
 class BackImageDataExtractor:
     """Enhanced extractor for back image data including address and MRZ information"""
     
     def __init__(self):
         self.address_patterns = {
-            "village": [r'VILLAGE:\s*([^.]+)\.?', r'VIL:\s*([^.]+)\.?'],
-            "parish": [r'PARISH:\s*([^.]+)\.?', r'PAR:\s*([^.]+)\.?'],
-            "subcounty": [r'S\.COUNTY:\s*([^.]+)\.?', r'SUBCOUNTY:\s*([^.]+)\.?', r'SUB-COUNTY:\s*([^.]+)\.?'],
-            "county": [r'COUNTY:\s*([^.]+)\.?'],
-            "district": [r'DISTRICT:\s*([^.]+)\.?', r'DIST:\s*([^.]+)\.?']
+            "village": [r'VILLAGE[:\s]*([^.]+?)(?:\s+PARISH|$)', r'VIL[:\s]*([^.]+?)(?:\s+PAR|$)'],
+            "parish": [r'PARISH[:\s]*([^.]+?)(?:\s+S\.COUNT|SUBCOUNTY|$)', r'PAR[:\s]*([^.]+?)(?:\s+S\.COUNT|SUBCOUNTY|$)'],
+            "subcounty": [r'S\.COUNT[Y]*[:\s]*([^.]+?)(?:\s+COUNT|$)', r'SUBCOUNTY[:\s]*([^.]+?)(?:\s+COUNT|$)', r'SUB-COUNTY[:\s]*([^.]+?)(?:\s+COUNT|$)'],
+            "county": [r'COUNT[Y]*[:\s]*([^.]+?)(?:\s+DISTRICT|$)'],
+            "district": [r'DISTRICT[:\s]*([^.]+?)(?:\s|$)', r'DIST[:\s]*([^.]+?)(?:\s|$)']
         }
         
         self.mrz_patterns = {
-            "document_type": r'^([A-Z]{1,2})',  # ID, P, etc.
-            "country_code": r'^[A-Z]{1,2}([A-Z]{3})',  # UGA, etc.
+            "document_type": r'^([A-Z]{1,2})',
+            "country_code": r'^[A-Z]{1,2}([A-Z]{3})',
             "nin_pattern": r'(CM|CF)([A-Z0-9]{12})',
-            "mrz_line": r'^[A-Z0-9<]{30,44}$'  # Standard MRZ line length
+            "mrz_line": r'^[A-Z0-9<\s]{30,}$'
         }
+    
+    def clean_mrz_line(self, line: str) -> str:
+        """Clean and normalize MRZ line by removing spaces and fixing common OCR errors"""
+        # Remove all spaces
+        cleaned = re.sub(r'\s+', '', line.upper())
+        
+        # Fix common OCR errors in MRZ
+        cleaned = cleaned.replace('O', '0')  # O to 0
+        cleaned = cleaned.replace('I', '1')  # I to 1
+        cleaned = cleaned.replace('Z', '2')  # Z to 2
+        cleaned = cleaned.replace('S', '5')  # S to 5
+        cleaned = cleaned.replace('/', '')   # Remove slashes
+        cleaned = cleaned.replace(':', '')   # Remove colons
+        
+        return cleaned
     
     def extract_address_info(self, lines: List[str]) -> Dict[str, str]:
         """Extract address information from back image text"""
@@ -192,25 +528,25 @@ class BackImageDataExtractor:
             "district": ""
         }
         
+        # Combine all lines and clean
         combined_text = ' '.join(lines).upper()
-        print(f"[DEBUG] Combined text for address extraction: {combined_text}")
         
+        # Look for address patterns
         for field, patterns in self.address_patterns.items():
             for pattern in patterns:
                 match = re.search(pattern, combined_text, re.IGNORECASE)
                 if match:
                     value = match.group(1).strip()
-                    # Clean up the value
-                    value = re.sub(r'[^\w\s-]', '', value).strip()
-                    if value and len(value) > 1:  # Avoid single characters
+                    # Clean up the value - remove unwanted characters
+                    value = re.sub(r'[^A-Z\s-]', '', value).strip()
+                    if value and len(value) > 1:
                         address_data[field] = value
-                        print(f"[DEBUG] Found {field}: {value}")
                         break
         
         return address_data
     
     def extract_mrz_data(self, lines: List[str]) -> Dict[str, Any]:
-        """Extract Machine Readable Zone (MRZ) data"""
+        """Extract Machine Readable Zone (MRZ) data with improved detection"""
         mrz_data = {
             "mrz_lines": [],
             "document_type": "",
@@ -224,16 +560,16 @@ class BackImageDataExtractor:
             "check_digits": {}
         }
         
-        # Find MRZ lines (lines with specific patterns)
+        # Process each line to find MRZ patterns
         for line in lines:
-            line_clean = line.strip()
+            line_clean = self.clean_mrz_line(line)
             
-            # Check if line looks like MRZ
-            if len(line_clean) >= 30 and re.match(r'^[A-Z0-9<]+$', line_clean):
-                mrz_data["mrz_lines"].append(line_clean)
-                print(f"[DEBUG] Found MRZ line: {line_clean}")
+            # Check if this looks like an MRZ line (contains ID + country + alphanumeric)
+            if (len(line_clean) >= 30 and 
+                re.match(r'^[A-Z0-9<]+$', line_clean) and
+                ('IDUGA' in line_clean or 'UGA' in line_clean)):
                 
-                # Try to extract specific data from this line
+                mrz_data["mrz_lines"].append(line_clean)
                 self._parse_mrz_line(line_clean, mrz_data)
         
         return mrz_data
@@ -241,44 +577,45 @@ class BackImageDataExtractor:
     def _parse_mrz_line(self, mrz_line: str, mrz_data: Dict[str, Any]):
         """Parse individual MRZ line for specific data"""
         
-        # Example MRZ line: IDUGA0235626084CM0303410NPP3J<0301017M3505090UGA250509<<<<<7
-        
-        # Extract document type and country (first 5 chars: IDUGA)
-        if len(mrz_line) >= 5:
-            doc_type_country = mrz_line[:5]
-            if doc_type_country.startswith('ID'):
-                mrz_data["document_type"] = "ID"
-                mrz_data["country_code"] = doc_type_country[2:5]  # UGA
+        # Extract document type and country (IDUGA pattern)
+        if mrz_line.startswith('IDUGA'):
+            mrz_data["document_type"] = "ID"
+            mrz_data["country_code"] = "UGA"
+            
+            # Extract document number (after IDUGA)
+            doc_num_match = re.search(r'IDUGA(\d+)', mrz_line)
+            if doc_num_match:
+                mrz_data["document_number"] = doc_num_match.group(1)
         
         # Extract NIN (CM/CF pattern)
         nin_match = re.search(r'(CM|CF)([A-Z0-9]{12})', mrz_line)
         if nin_match:
             mrz_data["nin"] = nin_match.group(1) + nin_match.group(2)
-            print(f"[DEBUG] Extracted NIN from MRZ: {mrz_data['nin']}")
         
-        # Extract dates and other info (this is complex and depends on MRZ format)
-        # For Ugandan ID: IDUGA + document_number + NIN + check + birth_date + sex + expiry + country + filler + check
-        
-        # Try to extract birth date (6 digits: YYMMDD)
-        date_pattern = r'(\d{6})'
-        dates = re.findall(date_pattern, mrz_line)
-        if dates:
-            for date in dates:
-                # Check if it could be a birth date (reasonable year range)
-                year = int(date[:2])
-                month = int(date[2:4])
-                day = int(date[4:6])
+        # Extract birth date (YYMMDD pattern)
+        # Look for 6-digit sequences that could be dates
+        date_matches = re.findall(r'(\d{6})', mrz_line)
+        for date_str in date_matches:
+            year = int(date_str[:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+            
+            # Validate date components
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                # Convert 2-digit year to 4-digit
+                full_year = 1900 + year if year >= 50 else 2000 + year
                 
-                if 1 <= month <= 12 and 1 <= day <= 31:
-                    # Convert 2-digit year to 4-digit (assume 1950-2049)
-                    full_year = 1900 + year if year >= 50 else 2000 + year
+                # Check if this is a reasonable birth date (not in the future, not too old)
+                from datetime import datetime
+                current_year = datetime.now().year
+                if 1930 <= full_year <= current_year - 10:  # Reasonable birth year range
                     mrz_data["birth_date"] = f"{full_year:04d}-{month:02d}-{day:02d}"
                     break
         
-        # Extract sex (M/F)
-        sex_match = re.search(r'(\d{6})([MF])', mrz_line)
+        # Extract sex (M/F after date)
+        sex_match = re.search(r'\d{6}([MF])', mrz_line)
         if sex_match:
-            mrz_data["sex"] = sex_match.group(2)
+            mrz_data["sex"] = sex_match.group(1)
     
     def extract_biometric_info(self, lines: List[str]) -> Dict[str, str]:
         """Extract biometric information like fingerprint references"""
@@ -300,14 +637,11 @@ class BackImageDataExtractor:
     
     def extract_complete_back_data(self, lines: List[str]) -> Dict[str, Any]:
         """Extract all available data from back image"""
-        print(f"\n[INFO] Processing {len(lines)} lines from back image")
         
-        # Extract different types of data
         address_data = self.extract_address_info(lines)
         mrz_data = self.extract_mrz_data(lines)
         biometric_data = self.extract_biometric_info(lines)
         
-        # Combine all data
         complete_back_data = {
             "raw_text_lines": lines,
             "address_information": address_data,
@@ -322,297 +656,526 @@ class BackImageDataExtractor:
             }
         }
         
-        print(f"[INFO] Back data extraction summary:")
-        print(f"  - Address fields found: {complete_back_data['extraction_metadata']['address_fields_found']}")
-        print(f"  - MRZ lines found: {complete_back_data['extraction_metadata']['mrz_lines_found']}")
-        print(f"  - NIN from MRZ: {complete_back_data['extraction_metadata']['nin_extracted_from_mrz']}")
-        print(f"  - Biometric info: {complete_back_data['extraction_metadata']['biometric_info_found']}")
-        
         return complete_back_data
-
 
 class IDCardProcessor:
     def __init__(self, 
-                 mongo_uri: str = "mongodb://localhost:27017/",
-                 db_name: str = "id_verification"):
+                mongo_uri: str = "mongodb://localhost:27017/",
+                db_name: str = "id_verification"):
         
-        # MongoDB setup
+        # Initialize MongoDB connection first
         self.client = MongoClient(mongo_uri)
         self.db = self.client[db_name]
         self.collection = self.db.id_cards
         
-        # Initialize integrated face verifier
-        self.face_verifier = FaceVerifier()
-        
-        # Initialize back image data extractor
+        # Initialize processors
+        self.face_verifier = MultiModelFaceVerifier()
         self.back_extractor = BackImageDataExtractor()
+        self.ocr_processor = MultiOCRProcessor()
         
-        # Load the OCR model
-        self.model = ocr_predictor(pretrained=True)
+        print("\n[ID CARD PROCESSOR INITIALIZED]")
+        print(f"- MongoDB Connected: {self.client.server_info()['ok'] == 1.0}")
         
-        # Define patterns for different field types - UPDATED FOR CM/CF
-        self.patterns = {
-            "date": [
-                r'\b\d{1,2}[./]\d{1,2}[./]\d{4}\b',  # DD/MM/YYYY or DD.MM.YYYY
-                r'\b\d{4}[./]\d{1,2}[./]\d{1,2}\b',  # YYYY/MM/DD or YYYY.MM.DD
-                r'\b\d{1,2}[-]\d{1,2}[-]\d{4}\b',    # DD-MM-YYYY
-            ],
-            "nin": [
-                r'\b(CM|CF)\d{12}\b',                # CM or CF followed by exactly 12 digits (14 total)
-                r'\b(CM|CF)[A-Z0-9]{12}\b',         # CM or CF followed by 12 alphanumeric chars
-            ],
-            "card_no": [
-                r'\bNPP\d+\b',                       # Starts with NPP
-                r'\b[A-Z]{3}\d+\b',                  # Three letters followed by numbers
-            ],
-            "gender": [
-                r'\b[MF]\b',                         # Single M or F
-                r'\bMALE\b|\bFEMALE\b',             # Full words
-            ],
-            "nationality": [
-                r'\bUGANDAN\b',
-                r'\bRWANDAN\b',
-                r'\bKENYAN\b',
-                r'\bTANZANIAN\b',
-            ]
+    def extract_text_from_image(self, image_path: str) -> Dict[str, Any]:
+        """Extract text using PaddleOCR and return all results with accuracy metrics"""
+        print(f"\n[EXTRACTING TEXT FROM {image_path}]")
+        
+        ocr_result = self.ocr_processor.extract_consensus_text(image_path)
+        
+        engine_results = {
+            'paddle': {
+                "texts": ocr_result['all_results']['paddle'],
+                "accuracy_score": 1.0,
+                "text_count": len(ocr_result['all_results']['paddle'])
+            }
         }
         
-        # Common field indicators
-        self.field_indicators = {
-            "surname": ["surname", "family name", "last name"],
-            "given_name": ["given name", "first name", "other names"],
-            "nationality": ["nationality", "citizen"],
-            "sex": ["sex", "gender"],
-            "date_of_birth": ["date of birth", "dob", "born"],
-            "nin": ["nin", "national id", "id number"],
-            "card_no": ["card no", "card number", "document no"],
-            "expiry": ["expiry", "expires", "valid until"],
-            "country": ["country", "republic of"]
+        return {
+            "consensus_text": ocr_result['consensus_text'],
+            "engine_results": engine_results,
+            "best_engine": "paddle"
         }
-
-    def extract_text_from_image(self, image_path):
-        """Extract text from image using OCR"""
-        doc = DocumentFile.from_images(image_path)
-        result = self.model(doc)
-        extracted_data = result.export()
+    
+    def extract_nin_from_combined_line(self, combined_line: str) -> Optional[str]:
+        """Enhanced NIN extraction supporting both CM and CF prefixes"""
+        # Clean the line first
+        cleaned_line = re.sub(r'\s+', '', combined_line.upper())
         
-        lines = []
-        for page in extracted_data['pages']:
-            for block in page['blocks']:
-                for line in block['lines']:
-                    line_text = " ".join(word['value'] for word in line['words'])
-                    if line_text.strip():
-                        lines.append(line_text.strip())
-        
-        return lines
-
-    def extract_nin_from_combined_line(self, combined_line):
-        """
-        Enhanced NIN extraction supporting both CM and CF prefixes
-        NIN must be exactly 14 characters total (CM/CF + 12 characters)
-        """
-        print(f"[DEBUG] Processing combined line: {combined_line}")
-        
-        # Method 1: Look for CM or CF in MRZ format
-        cm_cf_positions = []
-        for match in re.finditer(r'(CM|CF)', combined_line):
-            cm_cf_positions.append((match.start(), match.group()))
-        
-        print(f"[DEBUG] Found CM/CF at positions: {cm_cf_positions}")
-        
-        # Try each CM/CF position
-        for pos, prefix in cm_cf_positions:
-            remaining_text = combined_line[pos + 2:]  # Skip CM/CF (2 chars)
-            
-            # Extract exactly 12 alphanumeric characters
-            alphanumeric_chars = []
-            for char in remaining_text:
-                if char.isalnum():  # A-Z, 0-9
-                    alphanumeric_chars.append(char)
-                    if len(alphanumeric_chars) == 12:
-                        break
-            
-            if len(alphanumeric_chars) == 12:
-                nin = prefix + ''.join(alphanumeric_chars)
-                print(f"[DEBUG] Found NIN: {nin}")
-                return nin
-        
-        # Method 2: Standard pattern matching
+        # Method 1: Direct CM/CF pattern matching
         nin_patterns = [
             r'(CM|CF)([A-Z0-9]{12})',
             r'(CM|CF)(\d{12})',
         ]
         
         for pattern in nin_patterns:
-            matches = re.findall(pattern, combined_line)
+            matches = re.findall(pattern, cleaned_line)
             for match in matches:
                 prefix, suffix = match
                 if len(suffix) >= 12:
                     nin = prefix + suffix[:12]
-                    print(f"[DEBUG] Pattern match NIN: {nin}")
-                    return nin
+                    # Validate NIN format
+                    if len(nin) == 14 and nin[:2] in ['CM', 'CF'] and nin[2:].isalnum():
+                        return nin
         
-        print(f"[DEBUG] No valid NIN found in line: {combined_line}")
+        # Method 2: Look for CM/CF positions and extract following characters
+        for match in re.finditer(r'(CM|CF)', cleaned_line):
+            prefix = match.group()
+            start_pos = match.end()
+            remaining_text = cleaned_line[start_pos:]
+            
+            # Extract exactly 12 alphanumeric characters
+            alphanumeric_chars = []
+            for char in remaining_text:
+                if char.isalnum():
+                    alphanumeric_chars.append(char)
+                    if len(alphanumeric_chars) == 12:
+                        break
+            
+            if len(alphanumeric_chars) == 12:
+                nin = prefix + ''.join(alphanumeric_chars)
+                return nin
+        
         return None
 
-    def extract_nin_from_back_image(self, back_image_path):
+    def extract_nin_from_back_image(self, back_image_path: str) -> tuple:
         """Extract NIN from the back of ID card using enhanced extractor"""
-        print(f"[INFO] Processing back image: {back_image_path}")
-        
         try:
-            lines = self.extract_text_from_image(back_image_path)
+            print(f"\n[EXTRACTING NIN FROM BACK IMAGE: {back_image_path}]")
+            ocr_result = self.extract_text_from_image(back_image_path)
+            
+            # Get all OCR results, not just consensus
+            all_lines = []
+            for engine, texts in ocr_result['engine_results'].items():
+                all_lines.extend(texts['texts'])
+            
+            # Also include consensus
+            all_lines.extend(ocr_result['consensus_text'])
             
             # Use enhanced back extractor
-            back_data = self.back_extractor.extract_complete_back_data(lines)
+            back_data = self.back_extractor.extract_complete_back_data(all_lines)
             
             # First try to get NIN from MRZ data
             mrz_nin = back_data["machine_readable_zone"].get("nin")
             if mrz_nin and len(mrz_nin) == 14:
-                print(f"[SUCCESS] Found NIN from MRZ: {mrz_nin}")
-                return mrz_nin, back_data
+                print(f"- Found NIN in MRZ: {mrz_nin}")
+                return mrz_nin, back_data, ocr_result
             
-            # Fallback to line-by-line extraction
-            for line in lines:
+            # Fallback to line-by-line extraction from all OCR results
+            for i, line in enumerate(all_lines):
                 nin = self.extract_nin_from_combined_line(line)
                 if nin and len(nin) == 14 and nin.startswith(('CM', 'CF')):
-                    print(f"[SUCCESS] Found NIN in back image: {nin}")
-                    return nin, back_data
+                    print(f"- Found NIN in line {i+1}: {nin}")
+                    return nin, back_data, ocr_result
             
             # Try combined text
-            combined_text = ''.join(lines)
+            combined_text = ''.join(all_lines)
             nin = self.extract_nin_from_combined_line(combined_text)
             if nin and len(nin) == 14 and nin.startswith(('CM', 'CF')):
-                print(f"[SUCCESS] Found NIN in combined text: {nin}")
-                return nin, back_data
+                print(f"- Found NIN in combined text: {nin}")
+                return nin, back_data, ocr_result
             
-            return None, back_data
+            print("- No valid NIN found in back image")
+            return None, back_data, ocr_result
                 
         except Exception as e:
             print(f"[ERROR] Failed to process back image: {e}")
-            return None, {}
+            return None, {}, {}
 
-    def extract_structured_data(self, lines, back_image_path=None):
-        """Extract structured data from OCR lines for Ugandan ID format"""
+    def extract_structured_data(self, ocr_result: Dict[str, Any], back_image_path: Optional[str] = None) -> tuple:
+        """Structured data extraction with improved field parsing"""
+        print("\n[EXTRACTING STRUCTURED DATA FOR UGANDA NATIONAL ID]")
+        
         data = {
-            "COUNTRY": "",
+            "COUNTRY": "UGANDA",
+            "DOCUMENT_TYPE": "NATIONAL ID CARD",
             "SURNAME": "",
-            "GIVEN NAME": "",
+            "GIVEN_NAME": "",
             "NATIONALITY": "",
             "SEX": "",
-            "DATE OF BIRTH": "",
+            "DATE_OF_BIRTH": "",
             "NIN": "",
-            "CARD NO": "",
-            "DATE OF EXPIRY": "",
-            "HOLDER'S SIGNATURE": ""
+            "CARD_NUMBER": "",
+            "DATE_OF_EXPIRY": "",
+            "HOLDER_SIGNATURE": "",
+            "ADDRESS": {},
+            "BIOMETRICS": {}
         }
         
-        back_image_data = {}
+        all_lines = []
+        for engine, engine_data in ocr_result['engine_results'].items():
+            all_lines.extend(engine_data['texts'])
+        all_lines.extend(ocr_result['consensus_text'])
+        all_lines = [line.strip() for line in all_lines if line.strip()]
         
-        # Extract from front image
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-            line_upper = line_stripped.upper()
-            
-            if "REPUBLIC OF UGANDA" in line_upper:
-                data["COUNTRY"] = "UGANDA"
-            elif line_upper == "SURNAME" and i + 1 < len(lines):
-                data["SURNAME"] = lines[i + 1].strip()
-            elif line_upper == "GIVEN NAME" and i + 1 < len(lines):
-                data["GIVEN NAME"] = lines[i + 1].strip()
-            elif line_upper == "NATIONALITY":
-                if i + 3 < len(lines):
-                    data["NATIONALITY"] = lines[i + 3].strip()
-                if i + 4 < len(lines):
-                    data["SEX"] = lines[i + 4].strip()
-                if i + 5 < len(lines):
-                    data["DATE OF BIRTH"] = lines[i + 5].strip()
-            elif line_upper == "NIN":
-                if i + 2 < len(lines):
-                    combined_line = lines[i + 2].strip()
-                    extracted_nin = self.extract_nin_from_combined_line(combined_line)
-                    if extracted_nin:
-                        data["NIN"] = extracted_nin
-                    
-                    if i + 3 < len(lines):
-                        data["CARD NO"] = lines[i + 3].strip()
-            elif line_upper == "DATE OF EXPIRY" and i + 1 < len(lines):
-                data["DATE OF EXPIRY"] = lines[i + 1].strip()
-            elif line_upper in ["HOLDERS SIGNATURE", "HOLDER'S SIGNATURE"]:
-                data["HOLDER'S SIGNATURE"] = "Present"
-            
-            # Also check if any line contains NIN pattern
-            if not data["NIN"]:
-                extracted_nin = self.extract_nin_from_combined_line(line)
-                if extracted_nin:
-                    data["NIN"] = extracted_nin
+        print("\n[RAW OCR LINES]")
+        pprint(all_lines)
+        
+        # Smart field extraction - search for values in all lines
+        self._extract_field_values(all_lines, data)
+        
+        # Special NIN extraction (since it might appear in multiple places)
+        if not data["NIN"]:
+            for line in all_lines:
+                nin = self.extract_nin_from_combined_line(line)
+                if nin and len(nin) == 14 and nin.startswith(('CM', 'CF')):
+                    data["NIN"] = nin
+                    print(f"- Extracted NIN from alternative pattern: {nin}")
+                    break
         
         # Process back image if provided
-        if not data["NIN"] and back_image_path:
-            print("\n[INFO] NIN not found in front image, processing back image...")
-            back_nin, back_image_data = self.extract_nin_from_back_image(back_image_path)
-            if back_nin:
+        if back_image_path:
+            print("\n[PROCESSING BACK IMAGE DATA]")
+            back_nin, back_image_data, _ = self.extract_nin_from_back_image(back_image_path)
+            
+            if back_nin and not data["NIN"]:
                 data["NIN"] = back_nin
-        elif back_image_path:
-            print("\n[INFO] Processing back image for additional data...")
-            _, back_image_data = self.extract_nin_from_back_image(back_image_path)
+                print(f"- Using NIN from back image: {back_nin}")
+            
+            if back_image_data:
+                data["ADDRESS"] = back_image_data.get("address_information", {})
+                data["BIOMETRICS"] = back_image_data.get("biometric_information", {})
         
-        # Clean up nationality
-        if data["NATIONALITY"] == "UGA":
-            data["NATIONALITY"] = "UGANDAN"
-            
-        # Merge back image data with front data if MRZ contains additional info
-        if back_image_data and "machine_readable_zone" in back_image_data:
-            mrz = back_image_data["machine_readable_zone"]
-            
-            # Use MRZ data to fill missing fields
-            if not data["SEX"] and mrz.get("sex"):
-                data["SEX"] = mrz["sex"]
-            
-            if not data["DATE OF BIRTH"] and mrz.get("birth_date"):
-                data["DATE OF BIRTH"] = mrz["birth_date"]
-            
-            if data["NATIONALITY"] == "UGANDAN" and mrz.get("country_code") == "UGA":
-                # Confirm nationality from MRZ
-                pass
+        # Post-processing
+        data = self._post_process_extracted_data(data)
         
-        return data, back_image_data
+        print("\n[FINAL EXTRACTED DATA]")
+        pprint(data)
+        
+        return data, back_image_data if back_image_path else {}
 
-    def verify_face(self, id_card_path: str, selfie_path: str) -> Dict[str, Any]:
-        """Verify face similarity using integrated face verification"""
-        return self.face_verifier.verify_faces(id_card_path, selfie_path)
-
-    def save_to_mongodb(self, extracted_data: Dict[str, Any], 
-                       face_verification: Dict[str, Any],
-                       id_card_path: str,
-                       selfie_path: Optional[str] = None,
-                       back_image_path: Optional[str] = None,
-                       back_image_data: Optional[Dict[str, Any]] = None) -> str:
-        """Save extracted data and verification results to MongoDB"""
+    def _extract_field_values(self, all_lines: List[str], data: Dict) -> None:
+        """Extract field values by searching through all lines for the best matches"""
         
-        document = {
-            "extracted_data": extracted_data,
-            "face_verification": face_verification,
-            "back_image_data": back_image_data or {},
-            "metadata": {
-                "id_card_path": id_card_path,
-                "selfie_path": selfie_path,
-                "back_image_path": back_image_path,
-                "processed_at": datetime.utcnow(),
-                "processor_version": "3.0_ENHANCED_BACK_EXTRACTION",
-                "has_back_image": bool(back_image_path),
-                "back_data_extracted": bool(back_image_data)
-            },
-            "verification_status": {
-                "face_match": face_verification.get("match", False) if "error" not in face_verification else False,
-                "similarity_score": face_verification.get("distance", None) if "error" not in face_verification else None,
-                "verified": face_verification.get("match", False) and "error" not in face_verification
-            }
+        # Find all potential values for each field type
+        potential_values = {
+            "SURNAME": [],
+            "GIVEN_NAME": [],
+            "NATIONALITY": [],
+            "SEX": [],
+            "DATE_OF_BIRTH": [],
+            "CARD_NUMBER": [],
+            "DATE_OF_EXPIRY": [],
+            "NIN": []
         }
         
-        # Insert document and return the ID
-        result = self.collection.insert_one(document)
-        return str(result.inserted_id)
+        # Search through all lines for potential values
+        for i, line in enumerate(all_lines):
+            line_clean = line.strip()
+            line_upper = line_clean.upper()
+            
+            # Skip field labels themselves
+            if any(label in line_upper for label in ["SURNAME", "GIVEN NAME", "NATIONALITY", "SEX", 
+                                                  "DATE OF BIRTH", "CARD NO.", "DATE OF EXPIRY", 
+                                                  "HOLDERS SIGNATURE", "REPUBLIC", "NATIONAL ID"]):
+                continue
+            
+            # Look for dates (DD.MM.YYYY format)
+            if re.match(r'\d{2}\.\d{2}\.\d{4}', line_clean):
+                day, month, year = line_clean.split('.')
+                year_int = int(year)
+                formatted_date = f"{year}-{month}-{day}"
+                
+                if year_int < 2025:  # Likely birth date
+                    potential_values["DATE_OF_BIRTH"].append(formatted_date)
+                else:  # Likely expiry date
+                    potential_values["DATE_OF_EXPIRY"].append(formatted_date)
+            
+            # Look for 9-digit card numbers
+            digits_only = re.sub(r'[^0-9]', '', line_clean)
+            if len(digits_only) == 9:
+                potential_values["CARD_NUMBER"].append(digits_only)
+            
+            # Look for NIN (CM/CF + 12 alphanumeric)
+            nin = self.extract_nin_from_combined_line(line_clean)
+            if nin and len(nin) == 14 and nin.startswith(('CM', 'CF')):
+                potential_values["NIN"].append(nin)
+            
+            # Look for sex (single M or F)
+            if line_clean.upper() in ["M", "F"]:
+                potential_values["SEX"].append(line_clean.upper())
+            
+            # Look for nationality codes
+            if line_upper in ["UGA", "UG", "UGANDA", "UGANDAN"]:
+                potential_values["NATIONALITY"].append(line_upper)
+            
+            # Look for names (alphabetic strings with reasonable length)
+            if (len(line_clean) >= 2 and 
+                re.match(r'^[A-Z\- ]+$', line_upper) and 
+                not re.search(r'(CM|CF|UGA|REPUBLIC|NATIONAL|\d)', line_upper)):
+                
+                # Determine if it's more likely a surname or given name
+                # Simple heuristic: single words more likely surname, multiple words given name
+                words = line_clean.split()
+                if len(words) == 1 and len(line_clean) <= 15:
+                    potential_values["SURNAME"].append(line_clean.upper())
+                elif len(words) > 1:
+                    potential_values["GIVEN_NAME"].append(line_clean.upper())
+                else:
+                    # Add to both if uncertain
+                    potential_values["SURNAME"].append(line_clean.upper())
+                    potential_values["GIVEN_NAME"].append(line_clean.upper())
+        
+        # Select best values for each field
+        for field, candidates in potential_values.items():
+            if candidates and not data.get(field):
+                if field in ["SURNAME", "GIVEN_NAME"]:
+                    # For names, prefer the first valid candidate
+                    data[field] = candidates[0]
+                elif field in ["DATE_OF_BIRTH", "DATE_OF_EXPIRY"]:
+                    # For dates, prefer based on year logic
+                    data[field] = candidates[0]
+                elif field == "CARD_NUMBER":
+                    # For card number, take first 9-digit sequence
+                    data[field] = candidates[0]
+                elif field == "NIN":
+                    # For NIN, take first valid one
+                    data[field] = candidates[0]
+                elif field == "SEX":
+                    # For sex, take first M or F
+                    data[field] = candidates[0]
+                elif field == "NATIONALITY":
+                    # For nationality, prefer full forms
+                    if "UGANDAN" in candidates:
+                        data[field] = "UGANDAN"
+                    elif "UGANDA" in candidates:
+                        data[field] = "UGANDA"
+                    else:
+                        data[field] = candidates[0]
+                
+                if data[field]:
+                    print(f"- Extracted {field}: {data[field]}")
 
+    def _validate_field_value(self, field: str, value: str) -> bool:
+        """Enhanced field validation with NIN gender detection"""
+        if field == "SEX":
+            # Validate against NIN prefix if available
+            if hasattr(self, 'extracted_data') and self.extracted_data.get("NIN"):
+                nin_prefix = self.extracted_data["NIN"][:2]
+                if nin_prefix == "CF" and value.upper() != "F":
+                    return False
+                elif nin_prefix == "CM" and value.upper() != "M":
+                    return False
+            return value.upper() in ["M", "F"]
+        
+        elif field == "NIN":
+            if not (len(value) == 14 and value[:2] in ("CM", "CF") and value[2:].isalnum()):
+                return False
+            # Validate gender consistency if SEX field exists
+            if hasattr(self, 'extracted_data') and self.extracted_data.get("SEX"):
+                expected_gender = "F" if value.startswith("CF") else "M"
+                if self.extracted_data["SEX"].upper() != expected_gender:
+                    return False
+            return True
+        
+        elif field == "CARD_NUMBER":
+            # Must be different from NIN
+            if hasattr(self, 'extracted_data') and self.extracted_data.get("NIN"):
+                if value == self.extracted_data["NIN"]:
+                    return False
+            return 6 <= len(value) <= 20 and value.isalnum()
+        
+        elif field == "NATIONALITY":
+            # Convert UGA to UGANDAN
+            if value.upper() in ["UGA", "UG", "UGANDA"]:
+                return True
+            return len(value) >= 3 and value.isalpha()
+        
+        elif field.endswith("DATE"):
+            return self._validate_date(value)
+        
+        return True
+
+    def _validate_date(self, date_str: str) -> bool:
+        """Validate date format and ensure birth date is before 2025"""
+        try:
+            if '.' in date_str:
+                # Handle DD.MM.YYYY format
+                day, month, year = map(int, date_str.split('.'))
+            elif '-' in date_str:
+                # Handle YYYY-MM-DD format
+                year, month, day = map(int, date_str.split('-'))
+            else:
+                return False
+                
+            # Basic date validation
+            if not (1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100):
+                return False
+            
+            # Special validation for DATE_OF_BIRTH - must be before 2025
+            # Note: We need to check if this is being called for birth date
+            # This is a simplified check - in practice you might want to pass the field name
+            if year >= 2025:
+                # For birth dates, reject if year is 2025 or later
+                return False
+                
+            return True
+        except:
+            return False
+
+    def _post_process_extracted_data(self, data: Dict) -> Dict:
+        """Clean and standardize extracted data with enhanced validation"""
+        # 1. Determine gender from NIN if SEX field is empty
+        if not data.get("SEX") and data.get("NIN"):
+            if data["NIN"].startswith("CF"):
+                data["SEX"] = "F"
+            elif data["NIN"].startswith("CM"):
+                data["SEX"] = "M"
+        
+        # 2. Enhanced card number validation - only 9 digits
+        if data.get("CARD_NUMBER"):
+            card_num = re.sub(r'[^0-9]', '', data["CARD_NUMBER"])  # Keep only digits
+            if len(card_num) == 9:
+                data["CARD_NUMBER"] = card_num
+            else:
+                data["CARD_NUMBER"] = ""  # Clear invalid card number
+                print(f"- Invalid card number (not 9 digits): {data.get('CARD_NUMBER', 'N/A')}")
+        
+        # 3. Clean name fields
+        for field in ["SURNAME", "GIVEN_NAME"]:
+            if data.get(field):
+                cleaned = re.sub(r'[^A-Z\- ]', '', data[field].upper())
+                cleaned = ' '.join(cleaned.split())
+                if len(cleaned) >= 2 and not re.search(r'(CM|CF|UGA|\d{4,})', cleaned):
+                    data[field] = cleaned
+                else:
+                    data[field] = ""
+        
+        # 4. Standardize nationality (UGA should become UGANDAN)
+        if data.get("NATIONALITY"):
+            nat = data["NATIONALITY"].upper()
+            if nat in ["UGA", "UG", "UGANDA"]:
+                data["NATIONALITY"] = "UGANDAN"
+            elif len(nat) >= 3 and nat.isalpha():
+                data["NATIONALITY"] = nat.capitalize()
+            else:
+                data["NATIONALITY"] = ""
+        
+        # 5. Enhanced date validation and formatting
+        date_fields = ["DATE_OF_BIRTH", "DATE_OF_EXPIRY"]
+        for field in date_fields:
+            if data.get(field):
+                if isinstance(data[field], str):
+                    # Handle DD.MM.YYYY format
+                    if re.match(r'\d{2}\.\d{2}\.\d{4}', data[field]):
+                        day, month, year = data[field].split('.')
+                        year_int = int(year)
+                        
+                        # Special check for birth date - must be before 2025
+                        if field == "DATE_OF_BIRTH" and year_int >= 2025:
+                            print(f"- Invalid birth date (year {year_int} >= 2025): {data[field]}")
+                            data[field] = ""
+                            continue
+                            
+                        data[field] = f"{year}-{month}-{day}"
+                    # Handle YYYY-MM-DD format
+                    elif re.match(r'\d{4}-\d{2}-\d{2}', data[field]):
+                        year_int = int(data[field].split('-')[0])
+                        
+                        # Special check for birth date - must be before 2025
+                        if field == "DATE_OF_BIRTH" and year_int >= 2025:
+                            print(f"- Invalid birth date (year {year_int} >= 2025): {data[field]}")
+                            data[field] = ""
+                            continue
+                    # Handle other cases (like when OCR misreads date as text)
+                    else:
+                        data[field] = ""
+        
+        # 6. Remove empty nested dictionaries
+        if not any(data.get("ADDRESS", {}).values()):
+            data["ADDRESS"] = {}
+        if not any(data.get("BIOMETRICS", {}).values()):
+            data["BIOMETRICS"] = {}
+        
+        return data
+
+    def process_extraction_only(self, id_card_path: str, back_image_path: Optional[str] = None) -> Dict[str, Any]:
+        """Process just the data extraction without face verification"""
+        try:
+            print(f"\n[INFO] Starting extraction process for {id_card_path}")
+            
+            # Extract text from front image
+            ocr_result = self.extract_text_from_image(id_card_path)
+            
+            # Extract structured data
+            extracted_data, back_image_data = self.extract_structured_data(ocr_result, back_image_path)
+            
+            return {
+                "status": "success",
+                "extracted_data": extracted_data,
+                "back_data": back_image_data or {},
+                "raw_ocr_results": ocr_result,
+                "processed_at": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Extraction failed: {e}")
+            return {
+                "status": "error",
+                "message": str(e),
+                "extracted_data": {},
+                "back_data": {},
+                "raw_ocr_results": {},
+                "processed_at": datetime.utcnow().isoformat()
+            }
+
+    def verify_face(self, id_card_path: str, selfie_path: str) -> Dict[str, Any]:
+        """Verify face similarity using multiple models"""
+        return self.face_verifier.compare_faces_all_models(id_card_path, selfie_path)
+    
+    def save_to_mongodb(self, extracted_data: Dict[str, Any], 
+                    face_verification: Dict[str, Any],
+                    id_card_path: str,
+                    selfie_path: Optional[str] = None,
+                    back_image_path: Optional[str] = None,
+                    back_image_data: Optional[Dict[str, Any]] = None) -> str:
+        """Save extracted data and verification results to MongoDB"""
+        try:
+            document = {
+                "extracted_data": extracted_data,
+                "face_verification": face_verification,
+                "back_image_data": back_image_data or {},
+                "metadata": {
+                    "id_card_path": id_card_path,
+                    "selfie_path": selfie_path,
+                    "back_image_path": back_image_path,
+                    "processed_at": datetime.utcnow(),
+                    "processor_version": "4.0_MULTI_MODEL_FACE_VERIFICATION",
+                    "has_back_image": bool(back_image_path),
+                    "back_data_extracted": bool(back_image_data)
+                },
+                "verification_status": {
+                    "face_match": face_verification.get("verification_status", False),
+                    "similarity_score": face_verification.get("final_score", None),
+                    "verified": face_verification.get("verification_status", False),
+                    "model_details": {
+                        k: v for k, v in face_verification.items() 
+                        if k not in ["final_score", "verification_status"]
+                    }
+                }
+            }
+            
+            # Validate document before insertion
+            if not isinstance(document, dict):
+                raise ValueError("Document must be a dictionary")
+                
+            # Insert document and return the ID
+            print("\n[SAVING TO MONGODB]")
+            pprint(document)
+            result = self.collection.insert_one(document)
+            
+            if not result.inserted_id:
+                raise ValueError("Failed to insert document - no ID returned")
+                
+            print(f"- Document saved with ID: {result.inserted_id}")
+            return str(result.inserted_id)
+            
+        except pymongo.errors.PyMongoError as e:
+            print(f"[ERROR] MongoDB operation failed: {str(e)}")
+            raise
+        except Exception as e:
+            print(f"[ERROR] Failed to save document: {str(e)}")
+            raise
+    
     def get_verification_by_id(self, document_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve verification record by MongoDB document ID"""
         try:
@@ -640,50 +1203,47 @@ class IDCardProcessor:
     def process_complete_verification(self, id_card_path: str, 
                                     selfie_path: str,
                                     back_image_path: Optional[str] = None) -> Dict[str, Any]:
-        """Complete processing pipeline: OCR + Face Verification + MongoDB Storage"""
+        """Complete processing pipeline with detailed console output"""
         
-        print(f"[INFO] Starting enhanced complete verification process...")
-        print(f"[INFO] ID Card Front: {id_card_path}")
-        print(f"[INFO] Selfie: {selfie_path}")
+        print(f"\n{'='*50}")
+        print(f"[STARTING COMPLETE VERIFICATION PROCESS]")
+        print(f"- Front Image: {id_card_path}")
+        print(f"- Selfie Image: {selfie_path}")
         if back_image_path:
-            print(f"[INFO] ID Card Back: {back_image_path}")
+            print(f"- Back Image: {back_image_path}")
+        print(f"{'='*50}\n")
         
         # Step 1: Extract text from ID card front
-        print("\n[STEP 1] Extracting text from ID card front...")
-        front_lines = self.extract_text_from_image(id_card_path)
+        print("\n[STEP 1/4] EXTRACTING TEXT FROM ID CARD FRONT...")
+        ocr_result = self.extract_text_from_image(id_card_path)
         
-        print("\n[INFO] Extracted Text from Front:")
-        for i, line in enumerate(front_lines):
-            print(f"{i+1:2d}: {line}")
+        # Step 2: Extract structured data
+        print("\n[STEP 2/4] EXTRACTING STRUCTURED DATA...")
+        extracted_data, back_image_data = self.extract_structured_data(ocr_result, back_image_path)
         
-        # Step 2: Extract structured data (including enhanced back image processing)
-        print("\n[STEP 2] Extracting structured data with enhanced back processing...")
-        extracted_data, back_image_data = self.extract_structured_data(front_lines, back_image_path)
-        
-        print("\n🧾 Extracted ID Card Data:")
+        print("\n[STRUCTURED DATA EXTRACTION RESULTS]")
         pprint(extracted_data)
         
-        if back_image_data:
-            print("\n🔙 Enhanced Back Image Data:")
+        if back_image_path and back_image_data:
+            print("\n[BACK IMAGE DATA EXTRACTION RESULTS]")
             pprint(back_image_data)
         
         # Step 3: Verify face similarity
-        print("\n[STEP 3] Verifying face similarity...")
+        print("\n[STEP 3/4] VERIFYING FACE SIMILARITY...")
         face_verification = self.verify_face(id_card_path, selfie_path)
         
-        print("\n👤 Face Verification Results:")
+        print("\n[FACE VERIFICATION RESULTS]")
         pprint(face_verification)
         
-        # Step 4: Save to MongoDB with enhanced back data
-        print("\n[STEP 4] Saving to MongoDB...")
+        # Step 4: Save to MongoDB
+        print("\n[STEP 4/4] SAVING TO DATABASE...")
         document_id = self.save_to_mongodb(
             extracted_data, face_verification, 
             id_card_path, selfie_path, back_image_path, back_image_data
         )
         
-        print(f"✅ Saved to MongoDB with ID: {document_id}")
+        print(f"\n[PROCESS COMPLETE] Document ID: {document_id}")
         
-        # Return complete results
         return {
             "status": "success",
             "document_id": document_id,
@@ -704,27 +1264,30 @@ class IDCardProcessor:
         print("[INFO] MongoDB connection closed")
 
 
-# Example usage
+# Example usage with test images
 if __name__ == "__main__":
     try:
         # Initialize processor
+        print("\nInitializing ID Card Processor...")
         processor = IDCardProcessor()
         
         # Example paths (replace with actual paths)
-        id_front = "/id_front.jpg"
-        id_back = "path/to/id_back.jpg"
-        selfie = "path/to/selfie.jpg"
+        test_front = "test_id_front.jpg"
+        test_back = "test_id_back.jpg"
+        test_selfie = "test_selfie.jpg"
         
+        # Run complete verification
+        print("\nStarting complete verification process...")
         results = processor.process_complete_verification(
-            id_card_path=id_front,
-            selfie_path=selfie,
-            back_image_path=id_back
+            id_card_path=test_front,
+            selfie_path=test_selfie,
+            back_image_path=test_back
         )
         
-        print("\n🎉 Final Results:")
+        print("\n\n[FINAL PROCESSING RESULTS]")
         pprint(results)
         
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"\n[PROCESSING ERROR] {str(e)}")
     finally:
         processor.close()
